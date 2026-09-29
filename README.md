@@ -1,22 +1,8 @@
 # CHAOS WITNESS
 
-**Assurance-driven fault injection for agent platforms: which enterprise guarantees did this failure actually prove?**
+**A chaos test shows that an agent platform survived a fault. It does not show which of the platform's guarantees that fault could have broken.**
 
-An AI platform promises things: bounded retries, no duplicate refund when a tool call times out,
-no cross-tenant token reuse during an identity outage, fail closed on garbage LLM output, an answer
-within a deadline. A typical chaos test ("return 500 from the LLM, does it recover?") exercises a few
-of these promises by accident and says nothing about the others. CHAOS WITNESS starts from a
-declared **assurance contract**. For each obligation it generates the proxy faults that could falsify
-it, runs them against the platform, and records a verdict from evidence the platform does not write:
-proxy request logs, a side-effect ledger, the store, and client-side timing. The primary metric is
-**Assurance Claim Coverage (ACC)**: the weight of obligations with at least one triggered, observed,
-passing witness and no counterexample, divided by the weight of all required obligations. Obligations
-the injector cannot express stay in the denominator.
-
-> v0.1 research prototype. Runs locally on 127.0.0.1, with no cloud, no Docker, no LLM calls and no
-> runtime dependencies. The platform under test is **synthetic** (mock LLM, tool, identity and store)
-> and its weaknesses are planted. Every number below comes from
-> [`reports/benchmark.md`](reports/benchmark.md), which the commands below regenerate in about 90 s.
+CHAOS WITNESS derives fault campaigns from a declared assurance contract and reports, from evidence the platform does not write, which obligations were actually witnessed, which were falsified, and which this injector cannot reach.
 
 ```mermaid
 flowchart LR
@@ -31,7 +17,51 @@ flowchart LR
   V --> A[verdicts, counterexamples, ACC]
 ```
 
-## Evidence
+An AI platform promises things: bounded retries, no duplicate refund when a tool call times out,
+no cross-tenant token reuse during an identity outage, fail closed on garbage LLM output, an answer
+within a deadline. A typical chaos test ("return 500 from the LLM, does it recover?") exercises a few
+of these promises by accident and says nothing about the others. The primary metric is
+**Assurance Claim Coverage (ACC)**: the weight of obligations with at least one triggered, observed,
+passing witness and no counterexample, divided by the weight of all required obligations. Obligations
+the injector cannot express stay in the denominator.
+
+> v0.1 research prototype. Runs locally on 127.0.0.1, with no cloud, no Docker, no LLM calls and no
+> runtime dependencies. The platform under test is **synthetic** (mock LLM, tool, identity and store)
+> and its weaknesses are planted. Every number below comes from
+> [`reports/benchmark.md`](reports/benchmark.md), which the commands below regenerate in about 90 s.
+
+## Worked example
+
+The `global_token_fallback` build reuses the last token of *any* tenant when the identity provider
+fails. The workload runs acme (`r1`), globex (`r2`), acme (`r3`). The obligation-targeted campaign:
+
+```console
+$ python -m chaos_witness run --variant global_token_fallback
+witnessed      bounded_retry                          llm.http_500.all@r1
+witnessed      recovers_from_transient                llm.http_500.first@r1
+witnessed      honor_retry_after                      llm.http_429.first@r1
+witnessed      no_duplicate_side_effect               tool.drop_response.first@r1
+falsified      tenant_isolation                       identity.http_500.from2@r2
+witnessed      fail_closed_on_bad_llm_output          llm.http_500.all@r1
+witnessed      bounded_latency                        tool.timeout.first@r1
+witnessed      ack_implies_durable                    store.http_500.all@r1
+unwitnessable  token_expiry_under_clock_skew          no proxy fault expresses ['clock_skew']
+unwitnessable  rollback_preserves_healthy_revision    dependency ['deploy'] is not part of the system under test
+ACC 0.6667  triggered 30/30  unsafe runs 2/90
+```
+
+Exit status: 1.
+
+`tenant_isolation` names the `mid_session_outage` failure class, so the generator schedules an
+identity 500 *from the second request on*, after acme's token is cached. In run `r2` the proxy log
+shows the fault delivered to the identity dependency (the precondition), and the side-effect ledger
+shows globex's refund authorised by a token issued to acme (the invariant fails). The verdict comes
+from the proxy log and ledger, not from the orchestrator's answer, and the non-zero exit gates a
+pipeline. The same build under the manual checklist (`--campaign manual_checklist`) exits 0 and prints
+`witnessed tenant_isolation identity.reset.all@r1`: the IdP is killed before any token is cached, so
+the leak is reported as assurance.
+
+## Results
 
 Six campaigns were run against 9 builds of the platform: the hardened build, 7 single-weakness
 mutants and an all-weak build. Each fault configuration drives 3 runs over 2 tenants. The full sweep
@@ -53,22 +83,19 @@ executions. The seeded baselines are summarised over 200 seeds.
 cached, which "proves" tenant isolation on a build that leaks tokens. A 500 from the LLM "proves" fail-closed
 behaviour on a build that acts on truncated LLM output. No campaign produced a false alarm (an
 obligation falsified on the hardened build). Random injection needs roughly twice the budget to match
-the targeted campaign: at 60 faults it catches all 7 weaknesses in 98.0% of seeds, and at 90 in 100%.
+the targeted campaign:
 
-**What this does and does not show.**
-- **ACC on its own barely separates the good campaigns.** Random at the same budget reaches the ACC
-  ceiling in 95.0% of seeds. The measure that separates campaigns is falsification power against
-  real weaknesses, and a cheap witness can inflate ACC. Read ACC together with the mutant results.
-- **Targeted 7/7 and hardened-passes-everything are true by construction.** One author wrote the
-  obligations, the failure classes and the planted weaknesses. What the study measures is how far the
-  usual alternatives fall short, how much random budget closes the gap, and which part of targeting
-  matters. The ablation keeps the fault kinds but drops the dependency and schedule targeting, and
-  falls from 100% to 39.5% of seeds catching all 7. So the aim matters, not the fault vocabulary.
+| Random budget | ACC mean | P(ACC at ceiling) | Weaknesses detected, mean | P(all 7 detected) |
+|---|---|---|---|---|
+| 10 | 0.708 | 29.5% | 4.785 | 3.0% |
+| 20 | 0.783 | 78.5% | 5.935 | 25.5% |
+| 30 | 0.804 | 95.0% | 6.48 | 57.5% |
+| 45 | 0.808 | 99.0% | 6.805 | 82.0% |
+| 60 | 0.809 | 100.0% | 6.98 | 98.0% |
+| 90 | 0.809 | 100.0% | 7.0 | 100.0% |
 
 **Negative result.** Two of the 10 obligations (weight 4 of 21) cannot be witnessed by an HTTP fault
-proxy. `token_expiry_under_clock_skew` needs control of the platform's clock.
-`rollback_preserves_healthy_revision` needs a deployment control plane that the platform does not have.
-They are reported as `unwitnessable` and cap ACC at 0.809 for every campaign.
+proxy. They are reported as `unwitnessable` and cap ACC at 0.809 for every campaign.
 
 Counterexamples found by the targeted campaign (fault config @ run):
 `llm.http_500.all@r1` (unbounded retries), `llm.http_429.first@r1` (ignores Retry-After),
@@ -94,12 +121,11 @@ obligation is falsified, so it can gate a pipeline. Variants: `hardened`, `all_w
 weaknesses below. Campaigns: `targeted`, `untargeted_ablation`, `random_same_budget`,
 `manual_checklist`, `http_500_everywhere`, `llm_api_only`, `exhaustive`.
 
-## How it works
+## Mechanism
 
 - **Contract** ([`contract.json`](contract.json)). Each obligation has a statement, weight, scope (the
-  dependencies involved) and the failure classes that could falsify it (`persistent_failure`,
-  `transient_failure`, `throttle`, `ambiguous_outcome`, `mid_session_outage`, `malformed_response`,
-  `slow`, `clock_skew`, `deploy_rollback`). JSON is valid YAML 1.2; it keeps the core stdlib-only.
+  dependencies involved) and the failure classes that could falsify it. JSON is valid YAML 1.2; it
+  keeps the core stdlib-only.
 - **Generator** ([`chaos_witness/witness.py`](chaos_witness/witness.py)). Each failure class maps to
   proxy faults with a schedule. `ambiguous_outcome` is drop-after-forward, duplicate delivery or a held
   response on the *first* call. `mid_session_outage` is an identity failure *from the second request
@@ -119,7 +145,30 @@ weaknesses below. Campaigns: `targeted`, `untargeted_ablation`, `random_same_bud
   example "at most one ledger entry for this run"). No precondition, no verdict. That is what
   *triggered and observed* means here.
 
-### Failure taxonomy
+What the thesis needs from an enterprise platform, and what v0.1 does about each:
+
+| Item | v0.1 decision |
+|---|---|
+| Retries, timeouts, idempotency, deadlines | required: they are the subject of the obligations |
+| Identity / tenant isolation | required, mocked: a token service with per-tenant tokens; no real OIDC |
+| Durable state | mocked store; durability means "acknowledged implies stored", not crash durability |
+| Rollback | declared, and shown to be **unwitnessable** by this injector (negative result) |
+| OpenTelemetry | not used. Proxy logs and ledgers are the evidence; OTel traces are the natural real-world source (v0.2) |
+| CI, threat model | yes ([`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)); actions pinned by SHA, read-only token |
+| Policy-as-code, signed artifacts, Terraform, cloud integration tests | not required by the thesis; not built, not claimed |
+
+## Threat and failure model
+
+The main threat is evidence that looks like assurance but is not: the platform certifying itself, a
+fault configured but never delivered, a witness that could not have failed, or an obligation that
+silently drops out. Verdicts are computed only from the proxy logs, the side-effect ledger, the store
+and client-side timing; the orchestrator is untrusted and holds no reference to them. Witnesses that
+could not have failed are measured (false assurance), not prevented. The evidence collectors share
+one process with the platform under test, which is out of scope for v0.1. Full model:
+[`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md).
+
+**Fault kinds (9).** Each is applied on one dependency (`llm`, `tool`, `identity`, `store`) with a
+schedule: `first` (1st request to that dependency only), `all`, `from2` (2nd request onward).
 
 | Fault kind | What the proxy does |
 |---|---|
@@ -132,7 +181,22 @@ weaknesses below. Campaigns: `targeted`, `untargeted_ablation`, `random_same_bud
 | `duplicate` | delivers the request upstream twice |
 | `truncate` / `garble` | forwards, then returns half the body / the body with its quotes corrupted |
 
-Schedules: `first` (1st request to that dependency only), `all`, `from2` (2nd request onward).
+**Obligations (10, total weight 21)** and the failure classes that could falsify them:
+
+| Obligation | Weight | Failure class | Proxy faults generated |
+|---|---|---|---|
+| `bounded_retry` | 2 | `persistent_failure` | `http_500`, `reset` on `all` |
+| `recovers_from_transient` | 1 | `transient_failure` | `http_500`, `reset` on `first` |
+| `honor_retry_after` | 1 | `throttle` | `http_429` on `first` |
+| `no_duplicate_side_effect` | 3 | `ambiguous_outcome` | `drop_response`, `duplicate`, `timeout` on `first` |
+| `tenant_isolation` | 3 | `mid_session_outage` | `http_500`, `reset`, `timeout` on `from2` |
+| `fail_closed_on_bad_llm_output` | 3 | `malformed_response` | `truncate`, `garble` on `all` |
+| `bounded_latency` | 2 | `slow` | `latency`, `timeout` on `all` |
+| `ack_implies_durable` | 2 | `persistent_failure` | `http_500`, `reset` on `all` |
+| `token_expiry_under_clock_skew` | 2 | `clock_skew` | none: needs control of the platform's clock |
+| `rollback_preserves_healthy_revision` | 2 | `deploy_rollback` | none: needs a deployment control plane the platform does not have |
+
+**Planted weaknesses (7).**
 
 | Planted weakness | Knob flipped from the hardened build | Obligation it breaks |
 |---|---|---|
@@ -144,19 +208,68 @@ Schedules: `first` (1st request to that dependency only), `all`, `from2` (2nd re
 | `no_deadline` | 3 s per call, no run deadline | `bounded_latency` |
 | `acks_before_durable` | answer 200 when the store write failed | `ack_implies_durable` |
 
-## Enterprise bar: what the thesis needs
+**What cannot be expressed.** Clock skew and deployment rollback are not HTTP-level faults, so
+`token_expiry_under_clock_skew` and `rollback_preserves_healthy_revision` are reported as
+`unwitnessable`. Also outside the fault vocabulary: fault combinations and concurrent requests.
 
-| Item | v0.1 decision |
-|---|---|
-| Retries, timeouts, idempotency, deadlines | required: they are the subject of the obligations |
-| Identity / tenant isolation | required, mocked: a token service with per-tenant tokens; no real OIDC |
-| Durable state | mocked store; durability means "acknowledged implies stored", not crash durability |
-| Rollback | declared, and shown to be **unwitnessable** by this injector (negative result) |
-| OpenTelemetry | not used. Proxy logs and ledgers are the evidence; OTel traces are the natural real-world source (v0.2) |
-| CI, threat model | yes ([`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)); actions pinned by SHA, read-only token |
-| Policy-as-code, signed artifacts, Terraform, cloud integration tests | not required by the thesis; not built, not claimed |
+## Experiment design
 
-## Prior art and what is not new
+- **System under test.** The synthetic platform above in 9 builds: hardened, the 7 single-weakness
+  mutants, and all-weak. Workload: 3 sequential runs (acme, globex, acme). Every fault configuration
+  runs in isolation on fresh proxies and mocks: 972 executions in 88.0 s.
+- **Mechanism.** The obligation-targeted campaign (30 fault configs, deterministic).
+- **Naive baselines.** A manual chaos checklist (reset, latency, 500 on every dependency; 12 configs)
+  and HTTP 500 everywhere (every dependency x schedule; 12 configs).
+- **Prior-art-inspired baselines.** An LLM-API-only campaign (every fault kind x schedule on the LLM;
+  27 configs), which imitates AgentChaos's scope, and random fault injection with the same budget as
+  the targeted campaign (30 configs sampled from the 108-fault space).
+- **Ablation.** Same fault kinds as the targeted campaign, same budget, but dependency and schedule
+  not aimed at the obligations. It isolates the aim from the fault vocabulary.
+- **Reference.** The exhaustive sweep of all 108 single faults, which sets the ACC ceiling (0.809).
+- **Seeds.** Default seed 7 for the single-row results; random and ablation are also run over 200
+  seeds (7 to 206), and random at budgets 10, 20, 30, 45, 60 and 90.
+- **Metrics.** ACC on the hardened build; weaknesses caught (mutants whose broken obligation is
+  falsified); false assurance (mutants whose broken obligation is reported witnessed and passing);
+  false alarms on the hardened build; unsafe runs on all-weak (a duplicate, cross-tenant or fail-open
+  side effect, whatever the fault).
+- **Regenerate.** `python -m chaos_witness bench --out reports` writes
+  [`reports/benchmark.json`](reports/benchmark.json) and [`reports/benchmark.md`](reports/benchmark.md)
+  with provenance (commit, command, seed, Python, platform, contract hash). Single cells:
+  `python -m chaos_witness [--seed N] run --variant <build> --campaign <campaign>`.
+
+## What this result does not establish
+
+- **That targeting finds weaknesses in general.** Targeted 7/7 and hardened-passes-everything are true
+  by construction. One author wrote the obligations, the failure classes and the planted weaknesses.
+  What the study measures is how far the usual alternatives fall short, how much random budget closes
+  the gap, and which part of targeting matters. The ablation keeps the fault kinds but drops the
+  dependency and schedule targeting, and falls from 100% to 39.5% of seeds catching all 7. So the aim
+  matters, not the fault vocabulary.
+- **That a high ACC means a good campaign.** Random at the same budget reaches the ACC ceiling in 95.0%
+  of seeds. The measure that separates campaigns is falsification power against real weaknesses, and a
+  cheap witness can inflate ACC. Read ACC together with the mutant results.
+- **That a witnessed obligation had a strong witness.** On the hardened build, the first
+  tenant-isolation witness `run` prints is `identity.http_500.all@r1`, which could not have failed.
+  The generated campaign also contains a stronger one (`from2`), but ACC counts both the same.
+- **Anything about a real platform.** No real agent framework or real LLM/tool API was tested. The
+  mocks, weaknesses and workload are synthetic.
+- **Behaviour under combined or concurrent faults.** Single-fault configurations only: no fault
+  combinations, no concurrency (no races on idempotency keys), and a fixed sequential 3-run workload.
+- **Real-world timing.** Timing is scaled down: latency 1.5 s, hold 1.2 s, a 1.0 s latency obligation,
+  and a fractional `Retry-After: 0.3`. Real servers send integer seconds.
+- **Evidence integrity against a hostile platform.** The evidence collectors share one Python process
+  with the platform under test.
+- **The size of the targeting advantage elsewhere.** The random baseline samples from this proxy's
+  108-fault space; a larger fault space would favour targeting more.
+
+## Limitations
+
+- ACC does not grade witness strength; mutation-graded witnesses would fix this (v0.2).
+- Recovery time is not measured. Evidence completeness is 100% by construction, because every
+  dependency is proxied and every request carries a run id; with real dependencies it would not be.
+- Obligation weights are declared, not derived.
+
+## Research lineage
 
 - **AgentChaos** (Tan et al., ASE 2026, [arXiv 2608.06790](https://arxiv.org/abs/2608.06790)) injects
   crash, omission and value faults into LLM API responses at the HTTP layer across 65 fault
@@ -192,23 +305,11 @@ therefore narrowed. What remains is an engineering contribution:
 - a measured comparison of campaign strategies against planted weaknesses, including how often
   generic campaigns produce false assurance.
 
-## Limitations
+## Roadmap
 
-- **Circular by design.** The platform, its weaknesses, the obligations and the failure classes were
-  written by the same author. No real agent framework or real LLM/tool API was tested.
-- **ACC does not grade witness strength.** On the hardened build, the first tenant-isolation
-  witness `run` prints is `identity.http_500.all@r1`, which could not have failed. The generated
-  campaign also contains a stronger one (`from2`), but ACC counts both the same. Mutation-graded
-  witnesses would fix this (v0.2).
-- Single-fault configurations only: no fault combinations, no concurrency (no races on idempotency
-  keys), and a fixed sequential 3-run workload.
-- Timing is scaled down: latency 1.5 s, hold 1.2 s, a 1.0 s latency obligation, and a fractional
-  `Retry-After: 0.3`. Real servers send integer seconds.
-- The evidence collectors share one Python process with the platform under test (see the threat model).
-- Recovery time is not measured. Evidence completeness is 100% by construction, because every
-  dependency is proxied and every request carries a run id; with real dependencies it would not be.
-- Obligation weights are declared, not derived. The random baseline samples from this proxy's
-  108-fault space; a larger fault space would favour targeting more.
+Mutation-graded witnesses, fault combinations and concurrent workloads, Toxiproxy as an alternative
+backend, OpenTelemetry traces as the evidence source, clock and deployment fault injectors for the
+two unwitnessable obligations, and a real agent framework as the system under test.
 
 ## Layout
 
@@ -220,11 +321,5 @@ chaos_witness/witness.py      generator, baselines, execution, evidence checks, 
 chaos_witness/bench.py        benchmark and report
 reports/                      generated evidence (JSON + Markdown)
 ```
-
-## Next (v0.2)
-
-Mutation-graded witnesses, fault combinations and concurrent workloads, Toxiproxy as an alternative
-backend, OpenTelemetry traces as the evidence source, clock and deployment fault injectors for the
-two unwitnessable obligations, and a real agent framework as the system under test.
 
 MIT licensed.
