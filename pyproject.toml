@@ -1,0 +1,14 @@
+[project]
+name = "chaos-witness"
+version = "0.1.0"
+description = "Assurance-driven fault injection for agent platforms: fault campaigns generated from declared obligations, scored by Assurance Claim Coverage."
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
