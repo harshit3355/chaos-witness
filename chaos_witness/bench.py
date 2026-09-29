@@ -178,8 +178,7 @@ def markdown(rep: dict) -> str:
         x = hard["targeted"][o["id"]]
         if x["status"] == "unwitnessable":
             L.append(f"- `{o['id']}` (weight {o['weight']}): {o['statement']} Reason: {x['reason']}.")
-    L += ["", f"The ceiling for ACC with this fault injector is therefore "
-              f"{(tot - sum(o['weight'] for o in obs if hard['targeted'][o['id']]['status'] == 'unwitnessable')) / tot:.3f}"
-              " on this contract, whatever the campaign.", "", "## Provenance", ""]
+    L += ["", f"The ceiling for ACC with this fault injector is therefore {rep['acc_ceiling']:.3f} on this contract, "
+              "whatever the campaign.", "", "## Provenance", ""]
     L += [f"- {k}: `{v}`" for k, v in rep["provenance"].items()]
     return "\n".join(L) + "\n"
